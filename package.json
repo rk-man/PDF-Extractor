@@ -1,0 +1,33 @@
+{
+    "name": "project",
+    "version": "1.0.0",
+    "description": "",
+    "main": "server.js",
+    "module": "commonjs",
+    "scripts": {
+        "server": "nodemon run server"
+    },
+    "author": "",
+    "license": "ISC",
+    "dependencies": {
+        "@elastic/elasticsearch": "^8.10.0",
+        "@tensorflow-models/universal-sentence-encoder": "^1.3.3",
+        "@tensorflow/tfjs": "^4.11.0",
+        "@tensorflow/tfjs-core": "^4.11.0",
+        "@tensorflow/tfjs-node": "^4.11.0",
+        "@tensorflow/tfjs-node-gpu": "^4.11.0",
+        "compromise": "^14.10.0",
+        "config": "^3.3.9",
+        "csv-parser": "^3.0.0",
+        "dotenv": "^16.3.1",
+        "express": "^4.18.2",
+        "file-type": "^18.5.0",
+        "install": "^0.13.0",
+        "multer": "^1.4.5-lts.1",
+        "natural": "^6.7.2",
+        "npm": "^10.1.0",
+        "openai": "^4.0.0",
+        "pdf-parse": "^1.1.1",
+        "word2vec": "^1.1.5"
+    }
+}
