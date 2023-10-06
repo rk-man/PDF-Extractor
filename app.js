@@ -4,8 +4,12 @@ const multer = require("multer");
 const { OpenAI } = require("openai");
 const nlp = require("compromise");
 const pdf = require("pdf-parse");
-const Word2Vec = require("word2vec");
+const csv = require("csv-parser");
 const use = require("@tensorflow-models/universal-sentence-encoder");
+const {
+    findDataTypes,
+    convertStringToRespectiveTypes,
+} = require("./utils/findDataTypes");
 require("@tensorflow/tfjs-core");
 require("@tensorflow/tfjs-backend-cpu");
 require("@tensorflow/tfjs-node");
@@ -13,6 +17,9 @@ const { Client } = require("@elastic/elasticsearch");
 const client = new Client({
     node: "http://localhost:9200",
 });
+const fs = require("fs");
+const e = require("express");
+const { format } = require("path");
 
 const openai = new OpenAI({
     apiKey: process.env.CHATGPT_KEY,
@@ -25,7 +32,7 @@ app.use(express.json());
 const upload = multer();
 
 // Example usage with file upload (assuming Express.js)
-app.post("/upload", upload.single("file"), async (req, res) => {
+app.post("/upload/pdf", upload.single("file"), async (req, res) => {
     try {
         const file = req.file;
         console.log(file);
@@ -125,7 +132,7 @@ app.post("/upload", upload.single("file"), async (req, res) => {
     }
 });
 
-app.get("/documents/:doc_id", async (req, res) => {
+app.get("pdf/documents/:doc_id", async (req, res) => {
     try {
         const { query } = req.query;
         const { doc_id } = req.params;
@@ -200,6 +207,121 @@ app.get("/documents/:doc_id", async (req, res) => {
         return res.status(200).json({
             status: "success",
             results: chatgpt_res.choices[0].message.content,
+        });
+    } catch (err) {
+        console.log(err);
+        return res.status(500).json({ error: "Internal server error" });
+    }
+});
+
+app.post("/upload/csv", upload.single("file"), async (req, res, next) => {
+    try {
+        const file = req.file;
+        if (!file) {
+            return res.status(400).json({ error: "No file uploaded" });
+        }
+
+        // Converting csv buffer to string
+        let csv_string = file.buffer.toString();
+
+        // splitting the string into rows
+        let csv_arrays = csv_string.split("\n");
+
+        // Getting all the columns
+        let csv_columns = csv_arrays[0].split(",").map((item) => {
+            return item.trim();
+        });
+
+        // getting all data (rows)
+        let doc_id = uuid.v4();
+        let csv_docs = [];
+        for (let i = 1; i < csv_arrays.length; i++) {
+            let cur_row = csv_arrays[i].split(",").map((item) => {
+                return item.trim();
+            });
+
+            let cur_row_obj = {};
+
+            for (let i = 0; i < csv_columns.length; i++) {
+                cur_row_obj[`${csv_columns[i]}`] =
+                    convertStringToRespectiveTypes(cur_row[i]);
+            }
+            cur_row_obj.doc_id = i;
+            csv_docs.push(cur_row_obj);
+        }
+
+        // CREATING A UNIQUE INDEX FOR EACH CSV FILE
+        const indexName = file.originalname.split(".")[0].trim();
+
+        if (await client.indices.exists({ index: indexName })) {
+            return res.status(400).json({
+                message: "Index with this name already exists",
+            });
+        }
+
+        // INDEX MAPPING SCHEMA PROPERTIES
+        const mapping_properties = {};
+        for (let col of csv_columns) {
+            mapping_properties[`${col}`] = {
+                type: findDataTypes(csv_docs[0][col]),
+            };
+        }
+        mapping_properties.doc_id = {
+            type: "integer",
+        };
+
+        // CREATING INDEX
+        await client.indices.create({
+            index: indexName,
+            mappings: {
+                properties: mapping_properties,
+            },
+        });
+
+        // CREATING DOCUMENTS
+        const documents = [];
+        for (let doc of csv_docs) {
+            documents.push({ index: { _index: indexName } }, doc);
+        }
+
+        // BULK INGESTING DOCS
+        const bulk_ingestion = await client.bulk({
+            operations: documents,
+        });
+
+        return res.status(200).json({
+            docs: bulk_ingestion.items,
+        });
+    } catch (err) {
+        console.log(err);
+        return res.status(500).json({ error: "Internal server error" });
+    }
+});
+
+app.get("/csv/documents/:doc_id", async (req, res) => {
+    try {
+        const { query } = req.query;
+        const { doc_id } = req.params;
+        if (!doc_id) {
+            return res.status(400).json({
+                status: "fail",
+                message: "PLease specify the document id",
+            });
+        }
+        if (!query)
+            return res.status(400).json({
+                status: "fail",
+                message: "PLease enter some sql query",
+            });
+
+        const sql_response = await client.sql.query({
+            format: "txt",
+            query: query,
+        });
+
+        return res.status(200).json({
+            status: "Success",
+            results: sql_response,
         });
     } catch (err) {
         console.log(err);
