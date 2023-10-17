@@ -2,24 +2,19 @@ const express = require("express");
 const uuid = require("uuid");
 const multer = require("multer");
 const { OpenAI } = require("openai");
-const nlp = require("compromise");
 const pdf = require("pdf-parse");
-const csv = require("csv-parser");
-const use = require("@tensorflow-models/universal-sentence-encoder");
+const { RecursiveCharacterTextSplitter } = require("langchain/text_splitter");
+const { Document } = require("langchain/document");
 const {
     findDataTypes,
     convertStringToRespectiveTypes,
-} = require("./utils/findDataTypes");
-require("@tensorflow/tfjs-core");
-require("@tensorflow/tfjs-backend-cpu");
-require("@tensorflow/tfjs-node");
+} = require("./findDataTypes");
+
 const { Client } = require("@elastic/elasticsearch");
+
 const client = new Client({
     node: "http://localhost:9200",
 });
-const fs = require("fs");
-const e = require("express");
-const { format } = require("path");
 
 const openai = new OpenAI({
     apiKey: process.env.CHATGPT_KEY,
@@ -40,37 +35,33 @@ app.post("/upload/pdf", upload.single("file"), async (req, res) => {
             return res.status(400).json({ error: "No file uploaded" });
         }
 
-        let maxWords = 50;
         const text = await pdf(file.buffer);
-        const doc = nlp(text.text);
-        const sentences = doc.sentences().out("array");
-        // console.log(sentences);
+        let chunks = [];
 
-        const chunks = [];
-        let currentChunk = "";
-        for (const sentence of sentences) {
-            if ((currentChunk + " " + sentence).split(" ").length <= maxWords) {
-                currentChunk += " " + sentence;
-            } else {
-                chunks.push(currentChunk.trim());
-                currentChunk = sentence;
-            }
-        }
+        const splitter = new RecursiveCharacterTextSplitter({
+            chunkSize: 600,
+            chunkOverlap: 100,
+        });
 
-        if (currentChunk.trim() !== "") {
-            chunks.push(currentChunk.trim());
-        }
-        // console.log(chunks);
+        const docOutput = await splitter.splitDocuments([
+            new Document({ pageContent: text.text.toString() }),
+        ]);
 
-        const model = await use.load();
+        chunks = docOutput.map((doc) => {
+            return doc.pageContent;
+        });
 
-        const embeddings = await model.embed(chunks);
-        const vectors = embeddings.arraySync();
-        // embeddings.print(true);
-        console.log("CHUNKS");
-        console.log(chunks.length, chunks[0].length);
-        console.log("EMBEDDINGS");
-        console.log(vectors.length, vectors[0].length);
+        // CREATE VECTORS
+        const gpt_response = await openai.embeddings.create({
+            input: chunks,
+            model: "text-embedding-ada-002",
+        });
+
+        const vectors = gpt_response.data.map((doc) => {
+            return doc.embedding;
+        });
+
+        console.log(vectors[0].length);
 
         // CREATE AN INDEX
         const indexName = "vector-embeddings";
@@ -82,9 +73,9 @@ app.post("/upload/pdf", upload.single("file"), async (req, res) => {
                     properties: {
                         vectors: {
                             type: "dense_vector",
-                            dims: 512,
+                            dims: 1536,
                             index: true,
-                            similarity: "l2_norm",
+                            similarity: "dot_product",
                         },
                         text: {
                             type: "text",
@@ -99,7 +90,7 @@ app.post("/upload/pdf", upload.single("file"), async (req, res) => {
                 },
             });
         }
-
+        //
         const doc_id = uuid.v4();
 
         const filename = file.originalname.split(".")[0];
@@ -108,8 +99,9 @@ app.post("/upload/pdf", upload.single("file"), async (req, res) => {
 
         for (let idx = 0; idx < chunks.length; idx++) {
             documents.push(
-                { index: { _index: indexName } },
+                { index: { _index: indexName } }, // index properties
                 {
+                    // actual data
                     vectors: vectors[idx],
                     text: chunks[idx],
                     filename: filename,
@@ -118,9 +110,11 @@ app.post("/upload/pdf", upload.single("file"), async (req, res) => {
             );
         }
 
+        // ingesting multiple docs all at once.
         const bulk_ingestion = await client.bulk({
             operations: documents,
         });
+
         console.log(bulk_ingestion.items);
 
         return res.status(200).json({
@@ -132,32 +126,36 @@ app.post("/upload/pdf", upload.single("file"), async (req, res) => {
     }
 });
 
-app.get("pdf/documents/:doc_id", async (req, res) => {
+app.get("/pdf/documents/:doc_id", async (req, res) => {
     try {
         const { query } = req.query;
         const { doc_id } = req.params;
         const indexName = "vector-embeddings";
 
-        // conver user's query to vector
-        const model = await use.load();
+        // CREATE VECTORS
 
-        const embeddings = await model.embed(query);
-        const vectors = embeddings.arraySync();
+        const gpt_response = await openai.embeddings.create({
+            input: query,
+            model: "text-embedding-ada-002",
+        });
+
+        const vectors = gpt_response.data[0].embedding;
+        console.log(vectors);
 
         // Define the user's query
 
-        // if (!query) {
-        //     return res.status(400).json({
-        //         message: "Please enter some query",
-        //     });
-        // }
+        if (!query) {
+            return res.status(400).json({
+                message: "Please enter some query",
+            });
+        }
 
         const searchResponse = await client.search({
             index: indexName,
             body: {
                 knn: {
                     field: "vectors",
-                    query_vector: vectors[0],
+                    query_vector: vectors,
                     k: 10, // number of most similar results
                     num_candidates: 100,
                 },
@@ -180,12 +178,10 @@ app.get("pdf/documents/:doc_id", async (req, res) => {
             return hit._source.text;
         });
 
-        const gpt_formatted_search_results = searchResults.map((sr) => {
-            return {
-                role: "user",
-                content: sr,
-            };
-        });
+        let gpt_formatted_search_results = searchResults.join(" ");
+        gpt_formatted_search_results +=
+            " Analyze this context, deeply understand it in your own way and answer the following query : " +
+            query;
 
         // open ai chat completion
         const chatgpt_res = await openai.chat.completions.create({
@@ -194,12 +190,11 @@ app.get("pdf/documents/:doc_id", async (req, res) => {
                 {
                     role: "system",
                     content:
-                        "You are someone who explains things in a simple and clear manner with the help of some sentences",
+                        "You are an helpful assistant who specializes in understanding a content and have the ability to answer questions in a meaningful way",
                 },
-                ...gpt_formatted_search_results,
                 {
                     role: "user",
-                    content: query,
+                    content: gpt_formatted_search_results,
                 },
             ],
         });
@@ -208,6 +203,7 @@ app.get("pdf/documents/:doc_id", async (req, res) => {
             status: "success",
             results: chatgpt_res.choices[0].message.content,
         });
+        
     } catch (err) {
         console.log(err);
         return res.status(500).json({ error: "Internal server error" });
